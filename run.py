@@ -28,20 +28,11 @@ warnings.simplefilter('ignore', np.RankWarning)
 device = torch.device("cuda")
 print("device: %s" % device)
 
-# Global variables
-pix2pixmodel = None
-midasmodel = None
-srlnet = None
-factor = None
-whole_size_threshold = 3000  # R_max from the paper
-GPU_threshold = 1600 - 32 # Limit for the GPU (NVIDIA RTX 2080), can be adjusted 
-
 # MAIN PART OF OUR METHOD
 def run(dataset, option):
 
     # Load merge network
     opt = TestOptions().parse()
-    global pix2pixmodel
     pix2pixmodel = Pix2Pix4DepthModel(opt)
     pix2pixmodel.save_dir = './pix2pix/checkpoints/mergemodel'
     pix2pixmodel.load_networks('latest')
@@ -50,12 +41,12 @@ def run(dataset, option):
     # Decide which depth estimation network to load
     if option.depthNet == 0:
         midas_model_path = "midas/model.pt"
-        global midasmodel
+
         midasmodel = MidasNet(midas_model_path, non_negative=True)
         midasmodel.to(device)
         midasmodel.eval()
     elif option.depthNet == 1:
-        global srlnet
+
         srlnet = DepthNet.DepthNet()
         srlnet = torch.nn.DataParallel(srlnet, device_ids=[0]).cuda()
         checkpoint = torch.load('structuredrl/model.pth.tar')
@@ -131,7 +122,7 @@ def run(dataset, option):
 
         # Compute the multiplier described in section 6 of the main paper to make sure our initial patch can select
         # small high-density regions of the image.
-        global factor
+
         factor = max(min(1, 4 * patch_scale * whole_image_optimal_size / whole_size_threshold), 0.2)
         print('Adjust factor is:', 1/factor)
 
@@ -254,7 +245,7 @@ def run(dataset, option):
 
 
 # Generating local patches to perform the local refinement described in section 6 of the main paper.
-def generatepatchs(img, base_size):
+def generatepatchs(img, base_size, factor):
     
     # Compute the gradients as a proxy of the contextual cues.
     img_gray = rgb2gray(img)
@@ -279,7 +270,7 @@ def generatepatchs(img, base_size):
     # Refine initial Grid of patches by discarding the flat (in terms of gradients of the rgb image) ones. Refine
     # each patch size to ensure that there will be enough depth cues for the network to generate a consistent depth map.
     print("Selecting patchs ...")
-    patch_bound_list = adaptiveselection(grad_integral_image, patch_bound_list, gf)
+    patch_bound_list = adaptiveselection(grad_integral_image, patch_bound_list, gf, factor)
 
     # Sort the patch list to make sure the merging operation will be done with the correct order: starting from biggest
     # patch
@@ -288,7 +279,7 @@ def generatepatchs(img, base_size):
 
 
 # Adaptively select patches
-def adaptiveselection(integral_grad, patch_bound_list, gf):
+def adaptiveselection(integral_grad, patch_bound_list, gf, factor):
     patchlist = {}
     count = 0
     height, width = integral_grad.shape
@@ -340,14 +331,14 @@ def adaptiveselection(integral_grad, patch_bound_list, gf):
 
 
 # Generate a double-input depth estimation
-def doubleestimate(img, size1, size2, pix2pixsize, net_type):
+def doubleestimate(img, size1, size2, pix2pixsize, net_type, pix2pixmodel, GPU_threshold, midasmodel=None, srlnet=None):
     # Generate the low resolution estimation
-    estimate1 = singleestimate(img, size1, net_type)
+    estimate1 = singleestimate(img, size1, net_type, GPU_threshold, midasmodel=midasmodel, srlnet=srlnet)
     # Resize to the inference size of merge network.
     estimate1 = cv2.resize(estimate1, (pix2pixsize, pix2pixsize), interpolation=cv2.INTER_CUBIC)
 
     # Generate the high resolution estimation
-    estimate2 = singleestimate(img, size2, net_type)
+    estimate2 = singleestimate(img, size2, net_type, GPU_threshold, midasmodel=midasmodel, srlnet=srlnet)
     # Resize to the inference size of merge network.
     estimate2 = cv2.resize(estimate2, (pix2pixsize, pix2pixsize), interpolation=cv2.INTER_CUBIC)
 
@@ -365,19 +356,19 @@ def doubleestimate(img, size1, size2, pix2pixsize, net_type):
 
 
 # Generate a single-input depth estimation
-def singleestimate(img, msize, net_type):
+def singleestimate(img, msize, net_type, GPU_threshold, midasmodel=None, srlnet=None):
     if msize > GPU_threshold:
         print(" \t \t DEBUG| GPU THRESHOLD REACHED", msize, '--->', GPU_threshold)
         msize = GPU_threshold
 
     if net_type == 0:
-        return estimatemidas(img, msize)
+        return estimatemidas(img, msize, midasmodel)
     elif net_type == 1:
-        return estimatesrl(img, msize)
+        return estimatesrl(img, msize, srlnet)
 
 
 # Inference on SGRNet
-def estimatesrl(img, msize):
+def estimatesrl(img, msize, srlnet):
     # SGRNet forward pass script adapted from https://github.com/KexianHust/Structure-Guided-Ranking-Loss
     img_transform = transforms.Compose([
         transforms.ToTensor(),
@@ -402,7 +393,7 @@ def estimatesrl(img, msize):
     return depth_norm
 
 # Inference on MiDas-v2
-def estimatemidas(img, msize):
+def estimatemidas(img, msize, midasmodel):
     # MiDas -v2 forward pass script adapted from https://github.com/intel-isl/MiDaS/tree/v2
 
     transform = Compose(
